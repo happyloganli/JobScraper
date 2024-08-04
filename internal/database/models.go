@@ -11,11 +11,16 @@ import (
 )
 
 type JobPost struct {
-	ID                    uuid.UUID
-	Title                 string
-	Company               string
-	Location              string
-	Level                 string
-	MinimumQualifications []string
-	CreatedAt             time.Time
+	ID                      uuid.UUID
+	DetailUrl               string
+	Title                   string
+	Company                 string
+	Location                string
+	Level                   string
+	ApplyUrl                string
+	MinimumQualifications   []string
+	PreferredQualifications []string
+	AboutJob                []string
+	Responsibilities        []string
+	CreatedAt               time.Time
 }

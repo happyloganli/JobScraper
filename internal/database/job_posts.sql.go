@@ -14,39 +14,54 @@ import (
 )
 
 const createJobPost = `-- name: CreateJobPost :one
-INSERT INTO job_posts (id, title, company, location, level, minimum_qualifications, created_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
-    RETURNING id, title, company, location, level, minimum_qualifications, created_at
+INSERT INTO job_posts (id, detail_url, title, company, location, level, apply_url, minimum_qualifications, preferred_qualifications, about_job, responsibilities, created_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+    RETURNING id, detail_url, title, company, location, level, apply_url, minimum_qualifications, preferred_qualifications, about_job, responsibilities, created_at
 `
 
 type CreateJobPostParams struct {
-	ID                    uuid.UUID
-	Title                 string
-	Company               string
-	Location              string
-	Level                 string
-	MinimumQualifications []string
-	CreatedAt             time.Time
+	ID                      uuid.UUID
+	DetailUrl               string
+	Title                   string
+	Company                 string
+	Location                string
+	Level                   string
+	ApplyUrl                string
+	MinimumQualifications   []string
+	PreferredQualifications []string
+	AboutJob                []string
+	Responsibilities        []string
+	CreatedAt               time.Time
 }
 
 func (q *Queries) CreateJobPost(ctx context.Context, arg CreateJobPostParams) (JobPost, error) {
 	row := q.db.QueryRowContext(ctx, createJobPost,
 		arg.ID,
+		arg.DetailUrl,
 		arg.Title,
 		arg.Company,
 		arg.Location,
 		arg.Level,
+		arg.ApplyUrl,
 		pq.Array(arg.MinimumQualifications),
+		pq.Array(arg.PreferredQualifications),
+		pq.Array(arg.AboutJob),
+		pq.Array(arg.Responsibilities),
 		arg.CreatedAt,
 	)
 	var i JobPost
 	err := row.Scan(
 		&i.ID,
+		&i.DetailUrl,
 		&i.Title,
 		&i.Company,
 		&i.Location,
 		&i.Level,
+		&i.ApplyUrl,
 		pq.Array(&i.MinimumQualifications),
+		pq.Array(&i.PreferredQualifications),
+		pq.Array(&i.AboutJob),
+		pq.Array(&i.Responsibilities),
 		&i.CreatedAt,
 	)
 	return i, err

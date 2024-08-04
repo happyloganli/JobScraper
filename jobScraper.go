@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"github.com/gocolly/colly"
@@ -16,7 +17,7 @@ import (
 )
 
 type Job struct {
-	UUID                    uuid.UUID `json:"uuid"`
+	ID                      uuid.UUID `json:"uuid"`
 	DetailUrl               string    `json:"detail_url"`
 	Title                   string    `json:"title"`
 	Company                 string    `json:"company"`
@@ -27,20 +28,27 @@ type Job struct {
 	PreferredQualifications []string  `json:"preferredQualifications"`
 	AboutJob                []string  `json:"aboutJob"`
 	Responsibilities        []string  `json:"responsibilities"`
-	CreatedDate             string    `json:"createdDate"`
+	CreatedAt               time.Time `json:"createdAt"`
 }
 
 var (
-	detailPageChan = make(chan string, 10) // Channel for detail pages
-	jobChan        = make(chan Job, 100)   // Channel for jobs
+	detailPageChan = make(chan string, 10)
+	jobChan        = make(chan Job, 100)
+	dbNotification = make(chan string)
 	wg             sync.WaitGroup
 	visitedUrl     = make(map[string]struct{})
 	log            = logrus.New()
 	maxWorkers     = 10
+	maxRetries     = 3
 )
 
 func main() {
-	godotenv.Load(".env")
+
+	err := godotenv.Load(".env")
+	if err != nil {
+		log.Fatal("Error loading .env file")
+		return
+	}
 	logLevel, err := logrus.ParseLevel(strings.ToLower(os.Getenv("LOG_LEVEL")))
 	if err != nil {
 		logLevel = logrus.InfoLevel
@@ -52,52 +60,95 @@ func main() {
 	if dbURL == "" {
 		log.Fatal("$DB_URL is not found in the environment variables")
 	}
-
-	// Open a database instance
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		log.Fatal("Can not connect to database: ", err)
 	}
 	queries := database.New(db)
-	defer db.Close()
-
-	startTime := time.Now()
-
-	// Start workers
-	for i := 0; i < maxWorkers; i++ {
-		wg.Add(1)
-		go worker(queries)
-	}
+	defer func(db *sql.DB) {
+		err := db.Close()
+		if err != nil {
+			logrus.Errorf("Can not close database connection")
+		}
+	}(db)
 
 	// Start scraping list pages
 	go func() {
+		wg.Add(1)
+		defer wg.Done()
 		scrapeListPages()
 		close(detailPageChan)
 	}()
+
+	// Start workers
+	startTime := time.Now()
+	for i := 0; i < maxWorkers; i++ {
+		wg.Add(1)
+		go worker()
+	}
+
 	go func() {
 		for job := range jobChan {
-			logrus.Info(job)
+			_, err := queries.CreateJobPost(context.Background(), database.CreateJobPostParams{
+				ID:                      job.ID,
+				DetailUrl:               job.DetailUrl,
+				Title:                   job.Title,
+				Company:                 job.Company,
+				Location:                job.Location,
+				Level:                   job.Level,
+				ApplyUrl:                job.ApplyURL,
+				MinimumQualifications:   job.MinimumQualifications,
+				PreferredQualifications: job.PreferredQualifications,
+				AboutJob:                job.AboutJob,
+				Responsibilities:        job.Responsibilities,
+				CreatedAt:               job.CreatedAt,
+			})
+			if err != nil {
+				logrus.Errorf("Can not insert job post to database: %v", err)
+			}
 		}
+		logrus.Debugf("All jobs inserted")
+		dbNotification <- "finished"
 	}()
 
 	// Wait for all workers to finish
 	wg.Wait()
 	close(jobChan)
+	<-dbNotification
 	endTime := time.Now()
 	elapsedTime := endTime.Sub(startTime)
 	log.Infof("Scraping took %s\n", elapsedTime)
 }
 
-func worker(queries *database.Queries) {
+func worker() {
 	defer wg.Done()
 	for url := range detailPageChan {
-		scrapeDetailPage(url, queries)
-		time.Sleep(100 * time.Millisecond)
+		scrapeDetailPage(url)
 	}
 }
 
+func getNewCollector() (*colly.Collector, error) {
+	c := colly.NewCollector(
+		colly.AllowedDomains("google.com", "www.google.com"),
+		colly.UserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"),
+	)
+
+	err := c.Limit(&colly.LimitRule{
+		DomainGlob:  "*",
+		RandomDelay: 1 * time.Second,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
 func scrapeListPages() {
-	c := colly.NewCollector()
+
+	c, err := getNewCollector()
+	if err != nil {
+		log.Fatalf("Can not initiate collector: %v", err)
+	}
 	baseUrl := "https://www.google.com/about/careers/applications/"
 	var foundDetailURLs bool
 	c.OnHTML("a.WpHeLc.VfPpkd-mRLv6.VfPpkd-RLmnJb", func(e *colly.HTMLElement) {
@@ -119,13 +170,15 @@ func scrapeListPages() {
 
 	c.OnError(func(r *colly.Response, err error) {
 		logrus.Errorf("Request listpage failed with response status %d: %v", r.StatusCode, err)
+		retryRequest(r.Request)
 	})
 
-	for page := 1; ; page++ {
+	for page := 125; ; page++ {
 		listURL := fmt.Sprintf("https://www.google.com/about/careers/applications/jobs/results?page=%d", page)
+		foundDetailURLs = false
 		err := c.Visit(listURL)
 		if err != nil {
-			logrus.Errorf("Failed to visit list page URL: %v", err)
+			logrus.Errorf("Failed to visit list page %s: %v", listURL, err)
 			return
 		}
 
@@ -134,96 +187,39 @@ func scrapeListPages() {
 			logrus.Debugf("No new detail URLs found on page %d. Stopping list page scraping.", page)
 			return
 		}
-
-		time.Sleep(1000 * time.Millisecond)
 	}
 }
 
-func scrapeDetailPage(url string, queries *database.Queries) {
+func scrapeDetailPage(url string) {
+
+	c, err := getNewCollector()
+	if err != nil {
+		log.Fatalf("Can not initiate collector: %v", err)
+	}
 
 	logrus.Infof("Scraping detail page: %s", url)
-	c := colly.NewCollector()
 
 	// Extract job details
 	c.OnHTML("div.DkhPwc", func(e *colly.HTMLElement) {
 		job := Job{
 			// Populate the Job struct
-			UUID:        uuid.New(),
-			DetailUrl:   url,
-			Title:       e.ChildText("h2.p1N2lc"),
-			Company:     e.ChildText("span.RP7SMd span"),
-			Location:    e.ChildText("span.r0wTof"),
-			Level:       e.ChildText("span.wVSTAb"),
-			ApplyURL:    "https://www.google.com/about/careers/applications" + strings.TrimPrefix(e.ChildAttr("a.WpHeLc.VfPpkd-mRLv6.VfPpkd-RLmnJb", "href"), "."),
-			CreatedDate: time.Now().Format("2006-01-02 15:04:05"),
+			ID:        uuid.New(),
+			DetailUrl: url,
+			Title:     e.ChildText("h2.p1N2lc"),
+			Company:   e.ChildText("span.RP7SMd span"),
+			Location:  e.ChildText("span.r0wTof"),
+			Level:     e.ChildText("span.wVSTAb"),
+			AboutJob:  extractAboutJob(e),
+			ApplyURL:  "https://www.google.com/about/careers/applications" + strings.TrimPrefix(e.ChildAttr("a.WpHeLc.VfPpkd-mRLv6.VfPpkd-RLmnJb", "href"), "."),
+			CreatedAt: time.Now(),
 		}
-		//e.ForEach("div.KwJkGe ul li", func(_ int, el *colly.HTMLElement) {
-		//	job.MinimumQualifications = append(job.MinimumQualifications, strings.TrimSpace(el.Text))
-		//})
-		//e.ForEach("div.KwJkGe ul li", func(_ int, el *colly.HTMLElement) {
-		//	job.PreferredQualifications = append(job.MinimumQualifications, strings.TrimSpace(el.Text))
-		//})
-		e.ForEach("div.aG5W3 p", func(_ int, el *colly.HTMLElement) {
-			job.AboutJob = append(job.AboutJob, strings.TrimSpace(el.Text))
-		})
+
 		e.ForEach("div.BDNOWe ul li", func(_ int, el *colly.HTMLElement) {
 			job.Responsibilities = append(job.Responsibilities, strings.TrimSpace(el.Text))
 		})
 		job.MinimumQualifications, job.PreferredQualifications = extractQualifications(e)
 		jobChan <- job
 	})
-
-	//// Create an instance of Job struct
-	//job := &Job{}
-	//
-	//// OnHTML callback for job title
-	//c.OnHTML("h2.p1N2lc", func(e *colly.HTMLElement) {
-	//	job.Title = e.Text
-	//})
-	//
-	//// OnHTML callback for company name
-	//c.OnHTML("span.RP7SMd span", func(e *colly.HTMLElement) {
-	//	job.Company = e.Text
-	//})
-	//
-	//// OnHTML callback for location
-	//c.OnHTML("span.r0wTof", func(e *colly.HTMLElement) {
-	//	job.Location = e.Text
-	//})
-	//
-	//c.OnHTML("span.wVSTAb", func(e *colly.HTMLElement) {
-	//	job.Level = e.Text
-	//})
-	//
-	//// OnHTML callback for apply URL
-	//c.OnHTML("a.WpHeLc.VfPpkd-mRLv6.VfPpkd-RLmnJb", func(e *colly.HTMLElement) {
-	//	job.ApplyURL = "https://www.google.com/about/careers/applications" + strings.TrimPrefix(e.Attr("href"), ".")
-	//})
-	//
-	//// OnHTML callback for about job
-	//c.OnHTML("div.job-description", func(e *colly.HTMLElement) {
-	//	job.AboutJob = e.Text
-	//})
-	//
-	//// OnHTML callback for responsibilities
-	//c.OnHTML("div.responsibilities", func(e *colly.HTMLElement) {
-	//	job.Responsibilities = e.Text
-	//})
-	//
-	//// OnHTML callback for minimum qualifications
-	//c.OnHTML("div.KwJkGe", func(e *colly.HTMLElement) {
-	//
-	//	e.ForEach("ul li", func(_ int, el *colly.HTMLElement) {
-	//		job.MinimumQualifications = append(job.MinimumQualifications, strings.TrimSpace(el.Text))
-	//	})
-	//})
-	//
-	//// OnHTML callback for preferred qualifications
-	//c.OnHTML("div.Kp1N2lc", func(e *colly.HTMLElement) {
-	//	if strings.Contains(e.Text, "Preferred qualifications:") {
-	//		job.PreferredQualifications = e.Text
-	//	}
-	//})
 
 	c.OnRequest(func(r *colly.Request) {
 		logrus.Debugf("Requesting detail page URL: %s", r.URL.String())
@@ -235,12 +231,31 @@ func scrapeDetailPage(url string, queries *database.Queries) {
 
 	c.OnError(func(r *colly.Response, err error) {
 		logrus.Errorf("Request detail failed with response status %d: %v", r.StatusCode, err)
+		retryRequest(r.Request)
 	})
 
-	err := c.Visit(url)
+	err = c.Visit(url)
 	if err != nil {
 		logrus.Errorf("Failed to visit detail page URL: %v", url)
 		return
+	}
+}
+
+func retryRequest(request *colly.Request) {
+	retries, ok := request.Ctx.GetAny("retries").(int)
+	if !ok {
+		retries = 0
+	}
+	if retries < maxRetries {
+		request.Ctx.Put("retries", retries+1)
+		time.Sleep(2 * time.Second)
+		logrus.Infof("Retrying %s (%d/%d)", request.URL, retries+1, maxRetries)
+		err := request.Retry()
+		if err != nil {
+			logrus.Errorf("Retry failed : %v", err)
+		}
+	} else {
+		logrus.Errorf("Max retries reached for %s", request.URL)
 	}
 }
 
@@ -262,4 +277,23 @@ func extractQualifications(e *colly.HTMLElement) (minQuals []string, prefQuals [
 	})
 
 	return minQuals, prefQuals
+}
+
+func extractAboutJob(e *colly.HTMLElement) []string {
+	var aboutJob []string
+
+	// Check for single string case
+	if e.DOM.Find("div.aG5W3").ChildrenFiltered("p").Length() == 0 {
+		// No <p> tags, treat the entire div as a single string
+		aboutJob = append(aboutJob, e.ChildText("div.aG5W3"))
+	} else {
+		// Paragraphed case, collect all <p> tags
+		e.ForEach("div.aG5W3 p", func(_ int, p *colly.HTMLElement) {
+			text := p.Text
+			if text != "" {
+				aboutJob = append(aboutJob, text)
+			}
+		})
+	}
+	return aboutJob
 }
