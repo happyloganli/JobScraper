@@ -9,6 +9,7 @@ import (
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 	"github.com/sirupsen/logrus"
+	"log"
 	"math/rand"
 	"net/http"
 	"os"
@@ -17,18 +18,18 @@ import (
 	"time"
 )
 
-/*
-SFJob struct stores information of a job post.
+// Job represents a job posting with various details about the position.
 
-ID is the unique identifier for the job posting
-DetailUrl is the url where detail information of a job post could be found. Detail Url can also be used as a third party ID.
-Company is the name of the company offering the job.
-Title is the job Title.
-Location specifies the Location of the job.
-Level indicates the job level, such as "Early", "Mid", or "Advanced".
-ApplyURL is the URL where applicants can apply for the job.
-CreatedAt is the date when the job posting was created.
-*/
+// ID is a unique identifier for the job posting.
+// DetailUrl is the URL where more detailed information about the job can be found.
+// CreatedAt is the timestamp when the job posting was created.
+// Title is the job title or position name.
+// Location specifies where the job is located.
+// Employment describes the type of employment, such as full-time, part-time, or contract.
+// PostingDate is the date when the job was posted.
+// Description provides a detailed description of the job role and responsibilities.
+// JobID is an additional identifier for the job, which may be used by the job listing platform.
+// ApplyURL is the URL where applicants can submit their application for the job.
 type Job struct {
 	ID          uuid.UUID `json:"uuid"`
 	DetailUrl   string    `json:"detail_url"`
@@ -42,15 +43,13 @@ type Job struct {
 	ApplyURL    string    `json:"apply_url"`
 }
 
-/*
-log is an instance of logrus.Logger used for logging messages throughout the application.
-maxWorkers defines the maximum number of concurrent worker goroutines that can be used.
-maxRetries specifies the maximum number of times an operation should be retried in case of failure.
-initialBackoff specifies the initial backoff time
-scrapeDelay is the delay milliseconds of scraping two pages, to avoid being blocked by web server.
-*/
+// log is an instance of logrus.Logger used for logging messages throughout the application.
+// maxWorkers defines the maximum number of concurrent worker goroutines that can be used.
+// maxRetries specifies the maximum number of times an operation should be retried in case of failure.
+// initialBackoff specifies the initial backoff time
+// scrapeDelay is the delay milliseconds of scraping two pages, to avoid being blocked by web server.
+
 var (
-	log            = logrus.New()
 	maxWorkers     = 10
 	maxRetries     = 3
 	initialBackoff = 10 * time.Second
@@ -99,11 +98,12 @@ func main() {
 	if err != nil {
 		logLevel = logrus.InfoLevel
 	}
-	log.SetLevel(logLevel)
+	logrus.SetLevel(logLevel)
 
+	// Handler for scraping task request. Once receive a get request, start a scraping task.
+	// The Google Cloud Scheduler can schedule a task in this way.
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
-			// Start scraping process
 			go startScraping()
 			fmt.Fprintln(w, "Scraping started")
 		} else {
@@ -111,6 +111,7 @@ func main() {
 		}
 	})
 
+	// Listen on specific port
 	port := os.Getenv("PORT")
 	if port == "" {
 		log.Fatal("$PORT is not found in the environment variables")
@@ -119,6 +120,9 @@ func main() {
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
+// Start scraping a list. Extract detail page urls for each job post and store them in a channel.
+// Initiate workers to fetch detail page urls to scrape pages concurrently.
+// Scrapped jobs are sent to job channel and wait for database transfer.
 func startScraping() {
 
 	logrus.Infof("Starting scraping jobs...")
@@ -151,6 +155,7 @@ func startScraping() {
 	var jobBuffer []Job
 	dbNotification := make(chan string)
 
+	// Jobs are stored in a buffer that can reduce call to the BigQuery API.
 	go func() {
 		for job := range jobChan {
 			mu.Lock()
@@ -183,14 +188,11 @@ func startScraping() {
 
 	// Wait for all job posts are inserted into the database
 	<-dbNotification
-
 	return
 }
 
-/*
-worker method runs a worker to scrap detail pages. It fetches url of detail pages from detail page channel
-and runs scrapeDetailPage method
-*/
+// worker method runs a worker to scrap detail pages. It fetches url of detail pages from detail page channel
+// and runs scrapeDetailPage method
 func worker(detailPageChan chan string, jobChan chan Job) {
 	defer wg.Done()
 	for url := range detailPageChan {
@@ -199,10 +201,8 @@ func worker(detailPageChan chan string, jobChan chan Job) {
 	}
 }
 
-/*
-getNewCollector method initiate a new colly Collector.
-It sets the user agent.
-*/
+// getNewCollector method initiate a new colly Collector.
+// It sets the user agent.
 func getNewCollector() (*colly.Collector, error) {
 
 	// The collector can only request in allow domains and use the user agent.
@@ -212,10 +212,8 @@ func getNewCollector() (*colly.Collector, error) {
 	return c, nil
 }
 
-/*
-scrapeListPages handles scraping job listing pages and extracting detail URLs.
-It will keep scraping until the visited page has no detail URL.
-*/
+// scrapeListPages handles scraping job listing pages and extracting detail URLs.
+// It will keep scraping until the visited page has no detail URL.
 func scrapeListPages(visitedUrl map[string]struct{}, detailPageChan chan string) {
 
 	c, err := getNewCollector()

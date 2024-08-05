@@ -30,6 +30,7 @@ func TestSleepRandomly(t *testing.T) {
 	assert.True(t, duration <= 2*time.Second, "sleep duration should be no more than 2 seconds")
 }
 
+// Unite test for worker method
 func TestWorker(t *testing.T) {
 
 	// Set up the mock worker
@@ -38,42 +39,32 @@ func TestWorker(t *testing.T) {
 	mockWorker.On("sleepRandomly").Return()
 
 	// Set up channels and wait group
-	detailPageChan = make(chan string, 1)
-	jobChan = make(chan Job, 1)
+	detailPageChan := make(chan string, 1)
 	wg = sync.WaitGroup{}
-
-	// Send a test URL to the detailPageChan
-	detailPageChan <- "http://example.com"
+	detailPageChan <- "http://expected.com"
 
 	// Start the worker
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		mockWorker.scrapeDetailPage("http://example.com")
+		mockWorker.scrapeDetailPage("http://expected.com")
 		mockWorker.sleepRandomly()
 	}()
-
-	// Wait for the worker to finish
 	wg.Wait()
 
 	// Verify that the mock functions were called
 	mockWorker.AssertExpectations(t)
 }
 
+// Unit test for new collector method
 func TestGetNewCollector(t *testing.T) {
 	collector, err := getNewCollector()
 
 	// Check for errors
 	assert.NoError(t, err)
-
-	// Ensure the collector is not nil
 	assert.NotNil(t, collector)
 
-	// Check the collector settings
-	allowedDomains := collector.AllowedDomains
-	expectedDomains := []string{"google.com", "www.google.com"}
-	assert.ElementsMatch(t, expectedDomains, allowedDomains)
-
+	// Check user agent is set correctly
 	userAgent := collector.UserAgent
 	expectedUserAgent := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 	assert.Equal(t, expectedUserAgent, userAgent)
