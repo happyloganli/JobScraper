@@ -10,6 +10,7 @@ import (
 	_ "github.com/lib/pq"
 	"github.com/sirupsen/logrus"
 	"math/rand"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -57,16 +58,16 @@ maxRetries specifies the maximum number of times an operation should be retried 
 scrapeDelay is the delay milliseconds of scraping two pages, to avoid being blocked by web server.
 */
 var (
-	detailPageChan = make(chan string, 10)
-	jobChan        = make(chan Job, 100)
-	visitedUrl     = make(map[string]struct{})
-	log            = logrus.New()
-	maxWorkers     = 10
-	maxRetries     = 3
-	scrapeDelay    = 1000
-	batchSize      = 1000
-	wg             sync.WaitGroup
-	mu             sync.Mutex
+	//detailPageChan = make(chan string, 10)
+	//jobChan        = make(chan Job, 100)
+	//visitedUrl     = make(map[string]struct{})
+	log         = logrus.New()
+	maxWorkers  = 10
+	maxRetries  = 3
+	scrapeDelay = 10000
+	batchSize   = 1000
+	wg          sync.WaitGroup
+	mu          sync.Mutex
 )
 
 // Streaming insert Jobs to big query.
@@ -99,18 +100,46 @@ func main() {
 	}
 	log.SetLevel(logLevel)
 
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			// Start scraping process
+			startScraping()
+			fmt.Fprintln(w, "Scraping started")
+		} else {
+			http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
+		}
+	})
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		log.Fatal("$PORT is not found in the environment variables")
+	}
+	fmt.Printf("Server is starting on port %s...\n", port)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
+
+}
+
+func startScraping() {
+
+	logrus.Infof("Starting scraping jobs...")
+	defer logrus.Infof("Scraping jobs done")
+
+	detailPageChan := make(chan string, 10)
+	jobChan := make(chan Job, 100)
+	visitedUrl := make(map[string]struct{})
+
 	// Start a go routine to scrap list pages
 	go func() {
 		wg.Add(1)
 		defer wg.Done()
-		scrapeListPages()
+		scrapeListPages(visitedUrl, detailPageChan)
 		close(detailPageChan)
 	}()
 
 	// Start workers to scrap detail pages
 	for i := 0; i < maxWorkers; i++ {
 		wg.Add(1)
-		go worker()
+		go worker(detailPageChan, jobChan)
 	}
 
 	// Start a go routine to insert job posts to big query
@@ -155,6 +184,7 @@ func main() {
 
 	// Wait for all job posts are inserted into the database
 	<-dbNotification
+
 	return
 }
 
@@ -162,10 +192,10 @@ func main() {
 worker method runs a worker to scrap detail pages. It fetches url of detail pages from detail page channel
 and runs scrapeDetailPage method
 */
-func worker() {
+func worker(detailPageChan chan string, jobChan chan Job) {
 	defer wg.Done()
 	for url := range detailPageChan {
-		scrapeDetailPage(url)
+		scrapeDetailPage(url, jobChan)
 		sleepRandomly()
 	}
 }
@@ -189,7 +219,7 @@ func getNewCollector() (*colly.Collector, error) {
 scrapeListPages handles scraping job listing pages and extracting detail URLs.
 It will keep scraping until the visited page has no detail URL.
 */
-func scrapeListPages() {
+func scrapeListPages(visitedUrl map[string]struct{}, detailPageChan chan string) {
 
 	c, err := getNewCollector()
 	if err != nil {
@@ -227,7 +257,7 @@ func scrapeListPages() {
 
 	// Iterate the list pages. If no detail URLs found, stop scraping list pages
 	// Delayed randomly to avoid being blocked by the web server.
-	for page := 126; ; page++ {
+	for page := 1; ; page++ {
 		listURL := fmt.Sprintf("https://www.google.com/about/careers/applications/jobs/results?page=%d", page)
 		foundDetailURLs = false
 		err := c.Visit(listURL)
@@ -245,7 +275,7 @@ func scrapeListPages() {
 }
 
 // scrape the detail page and extracts job detail information and send job posts to the job channel
-func scrapeDetailPage(url string) {
+func scrapeDetailPage(url string, jobChan chan Job) {
 
 	c, err := getNewCollector()
 	if err != nil {
