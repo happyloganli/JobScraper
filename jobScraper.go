@@ -18,57 +18,44 @@ import (
 )
 
 /*
-Job struct stores information of a job post.
+SFJob struct stores information of a job post.
 
 ID is the unique identifier for the job posting
-DetailUrl is the url where detail information of a job post could be found. Detail Url can also be used as a third party id.
+DetailUrl is the url where detail information of a job post could be found. Detail Url can also be used as a third party ID.
 Company is the name of the company offering the job.
-Title is the job title.
-Location specifies the location of the job.
+Title is the job Title.
+Location specifies the Location of the job.
 Level indicates the job level, such as "Early", "Mid", or "Advanced".
 ApplyURL is the URL where applicants can apply for the job.
-MinimumQualifications lists the minimum qualifications required for the job.
-PreferredQualifications lists the qualifications that are preferred but not required.
-AboutJob provides a description of the job responsibilities and expectations.
-Responsibilities outlines the key responsibilities associated with the job.
 CreatedAt is the date when the job posting was created.
 */
 type Job struct {
-	ID                      uuid.UUID `json:"uuid"`
-	DetailUrl               string    `json:"detail_url"`
-	Title                   string    `json:"title"`
-	Company                 string    `json:"company"`
-	Location                string    `json:"location"`
-	Level                   string    `json:"level"`
-	ApplyURL                string    `json:"applyURL"`
-	MinimumQualifications   []string  `json:"minimumQualifications"`
-	PreferredQualifications []string  `json:"preferredQualifications"`
-	AboutJob                []string  `json:"aboutJob"`
-	Responsibilities        []string  `json:"responsibilities"`
-	CreatedAt               time.Time `json:"createdAt"`
+	ID          uuid.UUID `json:"uuid"`
+	DetailUrl   string    `json:"detail_url"`
+	CreatedAt   time.Time `json:"CreatedAt"`
+	Title       string    `json:"Title"`
+	Location    string    `json:"Location"`
+	Employment  string    `json:"Employment"`
+	PostingDate string    `json:"posting_date"`
+	Description string    `json:"Description"`
+	JobID       string    `json:"job_id"`
+	ApplyURL    string    `json:"apply_url"`
 }
 
 /*
-detailPageChan is a buffered channel used to handle detail page URLs or identifiers.
-jobChan is a buffered channel used to pass Job structs between different parts of the application.
-visitedUrl is a map used to track URLs that have already been processed to prevent reprocessing.
 log is an instance of logrus.Logger used for logging messages throughout the application.
 maxWorkers defines the maximum number of concurrent worker goroutines that can be used.
 maxRetries specifies the maximum number of times an operation should be retried in case of failure.
 initialBackoff specifies the initial backoff time
-maxBackoff specifies the max backoff time
 scrapeDelay is the delay milliseconds of scraping two pages, to avoid being blocked by web server.
 */
 var (
-	//detailPageChan = make(chan string, 10)
-	//jobChan        = make(chan Job, 100)
-	//visitedUrl     = make(map[string]struct{})
 	log            = logrus.New()
 	maxWorkers     = 10
 	maxRetries     = 3
-	initialBackoff = 2 * time.Second
-	scrapeDelay    = 2000
-	batchSize      = 1000
+	initialBackoff = 10 * time.Second
+	scrapeDelay    = 1000
+	batchSize      = 100
 	wg             sync.WaitGroup
 	mu             sync.Mutex
 )
@@ -130,7 +117,6 @@ func main() {
 	}
 	fmt.Printf("Server is starting on port %s...\n", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
-
 }
 
 func startScraping() {
@@ -188,7 +174,6 @@ func startScraping() {
 				logrus.Errorf("Failed to insert remaining job batch to BigQuery: %v", err)
 			}
 		}
-
 		dbNotification <- "ok"
 	}()
 
@@ -216,16 +201,14 @@ func worker(detailPageChan chan string, jobChan chan Job) {
 
 /*
 getNewCollector method initiate a new colly Collector.
-It sets the allow domains and user agent.
+It sets the user agent.
 */
 func getNewCollector() (*colly.Collector, error) {
 
 	// The collector can only request in allow domains and use the user agent.
 	c := colly.NewCollector(
-		colly.AllowedDomains("google.com", "www.google.com"),
 		colly.UserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"),
 	)
-
 	return c, nil
 }
 
@@ -244,9 +227,9 @@ func scrapeListPages(visitedUrl map[string]struct{}, detailPageChan chan string)
 	// The foundDetailURLS is a flag variable to check if the visited page contains detail page URL, if not the loop will stop.
 	// Extracted detail page URL will be sent to detailPageChan,visitedUrl is a map recording visited detailed pages,
 	// if a detail page URL visited it will not be sent to detailPageChan.
-	baseUrl := "https://www.google.com/about/careers/applications/"
+	baseUrl := os.Getenv("BASE_URL")
 	var foundDetailURLs bool
-	c.OnHTML("a.WpHeLc.VfPpkd-mRLv6.VfPpkd-RLmnJb", func(e *colly.HTMLElement) {
+	c.OnHTML("a.stretched-link.js-view-job", func(e *colly.HTMLElement) {
 		detailURL := baseUrl + e.Attr("href")
 		if _, exists := visitedUrl[detailURL]; !exists {
 			visitedUrl[detailURL] = struct{}{}
@@ -272,7 +255,7 @@ func scrapeListPages(visitedUrl map[string]struct{}, detailPageChan chan string)
 	// Iterate the list pages. If no detail URLs found, stop scraping list pages
 	// Delayed randomly to avoid being blocked by the web server.
 	for page := 1; ; page++ {
-		listURL := fmt.Sprintf("https://www.google.com/about/careers/applications/jobs/results?page=%d", page)
+		listURL := fmt.Sprintf("https://careers.salesforce.com/en/jobs/?page=%d#results", page)
 		foundDetailURLs = false
 		err := c.Visit(listURL)
 		if err != nil {
@@ -298,26 +281,23 @@ func scrapeDetailPage(url string, jobChan chan Job) {
 
 	logrus.Infof("Scraping detail page: %s", url)
 
-	// Extract job details. Create Job Objects and send them to JobChan, the database routine will insert them into database.
+	// Extract job details. Create SFJob Objects and send them to JobChan, the database routine will insert them into database.
 	//
-	c.OnHTML("div.DkhPwc", func(e *colly.HTMLElement) {
+	c.OnHTML("main", func(e *colly.HTMLElement) {
 		job := Job{
-			// Populate the Job struct
-			ID:        uuid.New(),
-			DetailUrl: url,
-			Title:     e.ChildText("h2.p1N2lc"),
-			Company:   e.ChildText("span.RP7SMd span"),
-			Location:  e.ChildText("span.r0wTof"),
-			Level:     e.ChildText("span.wVSTAb"),
-			AboutJob:  extractAboutJob(e),
-			ApplyURL:  "https://www.google.com/about/careers/applications" + strings.TrimPrefix(e.ChildAttr("a.WpHeLc.VfPpkd-mRLv6.VfPpkd-RLmnJb", "href"), "."),
-			CreatedAt: time.Now(),
+			// Populate the SFJob struct
+			ID:          uuid.New(),
+			DetailUrl:   url,
+			Title:       e.ChildText("h1.hero-heading"),
+			Location:    e.ChildText(".list-unstyled.job-meta li:nth-child(2)"),
+			Employment:  e.ChildText(".list-unstyled.job-meta li:nth-child(3)"),
+			PostingDate: e.ChildText(".list-unstyled.job-meta li:nth-child(4) time"),
+			JobID:       e.ChildText(".list-unstyled.job-meta li:nth-child(5)"),
+			Description: e.ChildText("article.cms-content p"),
+			ApplyURL:    e.ChildAttr("#js-apply-external", "href"),
+			CreatedAt:   time.Now(),
 		}
 
-		e.ForEach("div.BDNOWe ul li", func(_ int, el *colly.HTMLElement) {
-			job.Responsibilities = append(job.Responsibilities, strings.TrimSpace(el.Text))
-		})
-		job.MinimumQualifications, job.PreferredQualifications = extractQualifications(e)
 		jobChan <- job
 	})
 
@@ -367,46 +347,4 @@ func retryRequest(request *colly.Request) {
 	} else {
 		logrus.Errorf("Max retries reached for %s", request.URL)
 	}
-}
-
-// Helper method to extract minimum qualification and preferred qualification because they have same selectors.
-func extractQualifications(e *colly.HTMLElement) (minQuals []string, prefQuals []string) {
-	// Extract minimum qualifications
-	e.ForEach("div.KwJkGe h3:contains('Minimum qualifications:') + ul li", func(_ int, el *colly.HTMLElement) {
-		qualification := strings.TrimSpace(el.Text)
-		if qualification != "" {
-			minQuals = append(minQuals, qualification)
-		}
-	})
-
-	// Extract preferred qualifications
-	e.ForEach("div.KwJkGe h3:contains('Preferred qualifications:') + ul li", func(_ int, el *colly.HTMLElement) {
-		qualification := strings.TrimSpace(el.Text)
-		if qualification != "" {
-			prefQuals = append(prefQuals, qualification)
-		}
-	})
-
-	return minQuals, prefQuals
-}
-
-// Helper method to extract AboutJob.
-// The selector of AboutJob may contains a "<p>..</p>" or not.
-func extractAboutJob(e *colly.HTMLElement) []string {
-	var aboutJob []string
-
-	// Check for single string case
-	if e.DOM.Find("div.aG5W3").ChildrenFiltered("p").Length() == 0 {
-		// No <p> tags, treat the entire div as a single string
-		aboutJob = append(aboutJob, e.ChildText("div.aG5W3"))
-	} else {
-		// Paragraphed case, collect all <p> tags
-		e.ForEach("div.aG5W3 p", func(_ int, p *colly.HTMLElement) {
-			text := p.Text
-			if text != "" {
-				aboutJob = append(aboutJob, text)
-			}
-		})
-	}
-	return aboutJob
 }
