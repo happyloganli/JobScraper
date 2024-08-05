@@ -55,19 +55,22 @@ visitedUrl is a map used to track URLs that have already been processed to preve
 log is an instance of logrus.Logger used for logging messages throughout the application.
 maxWorkers defines the maximum number of concurrent worker goroutines that can be used.
 maxRetries specifies the maximum number of times an operation should be retried in case of failure.
+initialBackoff specifies the initial backoff time
+maxBackoff specifies the max backoff time
 scrapeDelay is the delay milliseconds of scraping two pages, to avoid being blocked by web server.
 */
 var (
 	//detailPageChan = make(chan string, 10)
 	//jobChan        = make(chan Job, 100)
 	//visitedUrl     = make(map[string]struct{})
-	log         = logrus.New()
-	maxWorkers  = 10
-	maxRetries  = 3
-	scrapeDelay = 10000
-	batchSize   = 1000
-	wg          sync.WaitGroup
-	mu          sync.Mutex
+	log            = logrus.New()
+	maxWorkers     = 10
+	maxRetries     = 3
+	initialBackoff = 2 * time.Second
+	scrapeDelay    = 2000
+	batchSize      = 1000
+	wg             sync.WaitGroup
+	mu             sync.Mutex
 )
 
 // Streaming insert Jobs to big query.
@@ -80,10 +83,21 @@ func insertJobsToBigQuery(jobs []Job, projectID, datasetID, tableID string) erro
 	defer client.Close()
 
 	inserter := client.Dataset(datasetID).Table(tableID).Inserter()
-	if err := inserter.Put(ctx, jobs); err != nil {
-		return err
+	var lastErr error
+
+	for retries := 0; retries < maxRetries; retries++ {
+		if err := inserter.Put(ctx, jobs); err != nil {
+			logrus.Errorf("Failed to insert jobs to BigQuery: %v", err)
+			lastErr = err
+			backoff := initialBackoff * (1 << retries)
+			logrus.Infof("Retrying in %v...", backoff)
+			time.Sleep(backoff)
+		} else {
+			logrus.Infof("Successfully inserted %d jobs to BigQuery", len(jobs))
+			return nil
+		}
 	}
-	return nil
+	return lastErr
 }
 
 func main() {
@@ -103,7 +117,7 @@ func main() {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
 			// Start scraping process
-			startScraping()
+			go startScraping()
 			fmt.Fprintln(w, "Scraping started")
 		} else {
 			http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
@@ -343,8 +357,9 @@ func retryRequest(request *colly.Request) {
 	}
 	if retries < maxRetries {
 		request.Ctx.Put("retries", retries+1)
-		time.Sleep(2 * time.Second)
-		logrus.Infof("Retrying %s (%d/%d)", request.URL, retries+1, maxRetries)
+		backoff := initialBackoff * (1 << retries)
+		logrus.Infof("Retrying in %v...", backoff)
+		time.Sleep(backoff)
 		err := request.Retry()
 		if err != nil {
 			logrus.Errorf("Retry failed : %v", err)
